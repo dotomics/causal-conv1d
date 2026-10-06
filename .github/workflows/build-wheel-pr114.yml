@@ -1,0 +1,145 @@
+# dotomics: builds ONE wheel of d59652d2 (head of Dao-AILab/causal-conv1d#114 on
+# v1.6.2.post1, mirrored as dotomics/causal-conv1d#2) and attaches it to release
+# v1.6.2.post1-pr114. Manual trigger only. The build steps are those of the
+# d59652d2 .github/workflows/_build.yml for a single config; build.sh comes from
+# the d59652d2 checkout.
+name: Build wheel (PR 114 mirror)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_SHA: d59652d2c918dc45b92eec4b75a675b20f05855d
+  RELEASE_TAG: v1.6.2.post1-pr114
+  PYTHON_VERSION: "3.12"
+  CUDA_VERSION: "12.9.1"
+  TORCH_VERSION: "2.10.0"
+  CXX11_ABI: "TRUE"
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout d59652d2
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          submodules: recursive
+
+      - name: Check the checkout is d59652d2
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set CUDA and PyTorch versions
+        run: |
+          echo "MATRIX_CUDA_VERSION=$(echo $CUDA_VERSION | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
+          echo "MATRIX_TORCH_VERSION=$(echo $TORCH_VERSION | awk -F \. {'print $1 "." $2'})" >> $GITHUB_ENV
+          echo "WHEEL_CUDA_VERSION=$(echo $CUDA_VERSION | awk -F \. {'print $1'})" >> $GITHUB_ENV
+          echo "MATRIX_PYTHON_VERSION=$(echo $PYTHON_VERSION | awk -F \. {'print $1 $2'})" >> $GITHUB_ENV
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Set up swap space
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
+
+      - name: Install CUDA ${{ env.CUDA_VERSION }}
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+          sub-packages: '["nvcc"]'
+
+      - name: Install PyTorch ${{ env.TORCH_VERSION }}
+        run: |
+          pip install --upgrade pip
+          pip install setuptools==68.0.0
+          pip install typing-extensions==4.12.2
+          # Same table as _build.yml: highest torch CUDA build <= system CUDA (cu128).
+          export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
+            available = {'2.10': [126, 128, 130]}[env['MATRIX_TORCH_VERSION']]; \
+            sys_cuda = int(env['MATRIX_CUDA_VERSION']); \
+            print(max(v for v in available if v <= sys_cuda))")
+          pip install --no-cache-dir torch==$TORCH_VERSION --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
+          nvcc --version
+          python --version
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "import torch; print('CUDA:', torch.version.cuda)"
+          python -c "import torch; print('CXX11 ABI:', torch._C._GLIBCXX_USE_CXX11_ABI)"
+          python -c "from torch.utils import cpp_extension; print (cpp_extension.CUDA_HOME)"
+
+      - name: Build wheel
+        id: build_wheel
+        run: |
+          EXIT_CODE=$(bash .github/scripts/build.sh | tail -n 1)
+          echo "build_exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+          exit $EXIT_CODE
+
+      - name: Wheel name, sha256 and archs
+        run: |
+          ls -l dist
+          WHEEL="dist/${wheel_name}"
+          echo "WHEEL_NAME ${wheel_name}"
+          echo "WHEEL_SHA256 $(sha256sum "$WHEEL" | cut -d' ' -f1)"
+          mkdir -p unpacked && cd unpacked && python -m zipfile -e "../$WHEEL" .
+          SO=$(ls causal_conv1d_cuda*.so)
+          echo "SO_SHA256 $(sha256sum "$SO" | cut -d' ' -f1)"
+          CUOBJDUMP=$(command -v cuobjdump || true)
+          if [ -z "$CUOBJDUMP" ]; then
+            sudo apt-get install -y "cuda-cuobjdump-12-9"
+            CUOBJDUMP=/usr/local/cuda-12.9/bin/cuobjdump
+          fi
+          "$CUOBJDUMP" --list-elf "$SO" | tee ../elf.txt
+          ARCHS=$(grep -o 'sm_[0-9]*' ../elf.txt | sort -u | tr '\n' ' ')
+          echo "ARCHS $ARCHS"
+          echo "$ARCHS" | grep -qw sm_90
+          echo "$ARCHS" | grep -qw sm_100
+          cd ..
+          {
+            echo "WHEEL_SHA256=$(sha256sum "$WHEEL" | cut -d' ' -f1)"
+            echo "SO_SHA256=$(sha256sum "unpacked/$SO" | cut -d' ' -f1)"
+            echo "ARCHS=$ARCHS"
+            echo "NVCC=$(nvcc --version | grep -o 'release [0-9.]*, V[0-9.]*')"
+            echo "TORCH=$(python -c 'import torch; print(torch.__version__)')"
+          } >> "$GITHUB_ENV"
+
+      - name: Create or attach to release ${{ env.RELEASE_TAG }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > notes.md <<EOF
+          Exact mirror of [Dao-AILab/causal-conv1d#114](https://github.com/Dao-AILab/causal-conv1d/pull/114) at its head \`$SOURCE_SHA\`: upstream v1.6.2.post1 plus the PR's 19 commits, no changes of ours. Mirror PR: https://github.com/${{ github.repository }}/pull/2. The code change is 595c6262 (Kyle Mylonakis), 64-bit indexing in the conv kernels.
+
+          Build ([run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})): ubuntu-22.04 x86_64, Python $PYTHON_VERSION, torch $TORCH, CUDA $CUDA_VERSION (nvcc $NVCC), CXX11 ABI $CXX11_ABI, archs $ARCHS.
+
+          - \`${wheel_name}\` sha256 \`$WHEEL_SHA256\`
+          - \`causal_conv1d_cuda\` extension sha256 \`$SO_SHA256\`
+
+          Built for BOTANIC long-context Mamba2 (dotomics/living-models-research#2160). Superseded once upstream releases #114.
+          EOF
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "dist/${wheel_name}" --clobber --repo "${{ github.repository }}"
+            gh release edit "$RELEASE_TAG" --notes-file notes.md --repo "${{ github.repository }}"
+          else
+            gh release create "$RELEASE_TAG" "dist/${wheel_name}" --verify-tag \
+              --title "$RELEASE_TAG" --notes-file notes.md --repo "${{ github.repository }}"
+          fi
